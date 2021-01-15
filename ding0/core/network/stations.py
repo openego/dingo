@@ -215,7 +215,10 @@ class LVStationDing0(StationDing0):
     @property
     def pypsa_id(self):
         #TODO: docstring
-        """ Description    
+        """ Description
+        self = LVStation
+        self._grid = LVGridDing0
+
         """
         return '_'.join(['MV', str(
             self.grid.grid_district.lv_load_area.mv_grid_district.mv_grid.\

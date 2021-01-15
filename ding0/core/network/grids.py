@@ -25,7 +25,10 @@ from ding0.tools import config as cfg_ding0, pypsa_io, tools
 from ding0.tools.geo import calc_geo_dist_vincenty
 from ding0.grid.mv_grid.tools import set_circuit_breakers
 from ding0.flexopt.reinforce_grid import *
-from ding0.core.structure.regions import LVLoadAreaCentreDing0
+from ding0.core.structure.regions import LVLoadAreaCentreDing0,LVGridDistrictDing0
+
+from Urban import *
+import geopandas as gpd
 
 import os
 import networkx as nx
@@ -33,6 +36,7 @@ from datetime import datetime
 import pyproj
 from functools import partial
 import logging
+
 
 if not 'READTHEDOCS' in os.environ:
     from shapely.ops import transform
@@ -352,6 +356,184 @@ class MVGridDing0(GridDing0):
                 for branch in lv_grid_district.lv_grid.graph_edges():
                     branch['branch'].id_db = lv_grid_district.id_db * 10**7 + ctr
                     ctr += 1
+
+    def routing_urban(self, debug=False, anim=None):
+        """ Performs routing on Load Area centres to build MV grid with ring topology.
+
+        Args
+        ----
+        debug: bool, defaults to False
+            If True, information is printed while routing
+        anim: type, defaults to None
+            Descr #TODO
+        """
+
+        #Import sector table for the MVGD
+        sector_data = osm_lu_import(self.grid_district)
+
+        #Import building footprints inside the given MVGD and create a geopandasDataframe. Each row corresponds to an specific building
+        gdf_footprints = import_footprints_area(self.grid_district.geo_data)
+
+        #Combine and clean the data of the sector table and the building. Add 'area' and 'load' as dataframe's columns .
+        gdf_sector_table = clean_data(gdf_footprints, sector_data)
+
+        #Inspects and plots load and area distributions in the dataset
+        #load_area_stats(gdf_sector_table)
+
+        #Extract HV/MV Station and create a geodataframe with its information
+        mv_station_gdf = gpd.GeoDataFrame(geometry=[self._station.geo_data], crs = {'init':'epsg:4326'}) #HV/MV station (4326)
+        mv_station_gdf['subst_id'] = self.id_db
+
+        #Calculate number of transformers, apply k-means to buildings and return building's corresponding cluster/transformer
+        trafo_geodata = trafo_pos_and_load(gdf_sector_table) #Tuple with position, load of transformers and a gdf with building information
+        gdf_buildings_trafos = trafo_geodata[2] #Contains building_id,geographical data, and transformer_id to which every building is connected to
+
+        #Inspect and plot load distribution for all transformers in the MVGD
+        #plot_station_power_dist(trafo_geodata[1])
+
+        #Place transformers as nodes in the closest street within a street network, where (nodes,edges) represent (crossings,streetways) respectively
+        #Return the network and a geodataframe with the newly placed transformers #TODO:Add to BA Methods
+        street_graph_trafos, trafo_conn_gdf = append_trafos(self.grid_district.geo_data, trafo_geodata)
+
+        #Include load information of every transformer in their corresponding graph node
+        for station in trafo_geodata[1]:
+            street_graph_trafos.nodes[int(station)]['load'] = trafo_geodata[1][station]
+
+        #Calculate vincenty distance between trafos
+        #plot_distance_trafos(trafo_conn_gdf)
+
+        #Connect the HV/MV Station to the graph and return the graph as well as the new geodataframe
+        street_graph_station, station_conn_gdf = find_stat_connection(mv_station_gdf, street_graph_trafos,
+                                                                      radius_inc=1e-6)
+
+        #Initialize load of MVstation to 0 in the graph
+        street_graph_station.nodes[[x for x, data in street_graph_station.nodes(data=True) if data['mv_station'] == True][0]]['load'] = 0
+
+        #Make street graph undirected and find largest connected subgraph in order for Dijkstra's algorithm to be applied
+        B = street_graph_station.to_undirected()
+        A = (B.subgraph(c) for c in nx.connected_components(B))
+        street_graph_station = list(A)[0]
+
+        #Verify the graphs completeness
+        print('Is the graph connected? ', nx.is_connected(street_graph_station))
+
+        #Apply Dijsktra shortest path to every pair of transformers to reduce the street graph
+        #reduced_graph = reduce_street_graph(street_graph_station, rf=2, plot=False)
+        #print("Number of transformers after Dijsktra reduction is ", len([att for node, att in reduced_graph.nodes(data=True) if att['trafo'] == True]))
+
+        #Remove transformers that aren'nt connected to the ring structure
+        #reduced_graph2 = remove_stubs(reduced_graph)  # Removes stubs (Smaller Trafos that aren'nt included in the ring)
+        #print("Number of transformers after removing stubs is ", len([att for node, att in reduced_graph2.nodes(data=True) if att['trafo'] == True]))
+
+        #Extract station data
+
+        #Extract node information from the graph in form of tuples with (id, data) structure, were data is a dict containing all relevant information.
+        mv_station_tuple = [(x,data) for x, data in street_graph_station.nodes(data=True) if data['mv_station'] == True][0]
+        lv_station_tuple = [(x,data) for x, data in street_graph_station.nodes(data=True) if data['trafo'] == True
+                            and data['mv_station'] == False]
+
+        #Create a mapping dict to later replace station nodes in graph with Ding0 Objects
+        mapping = {}
+        mapping[mv_station_tuple[0]] = self._station
+
+        mvgd_lv_load_areas = self.grid_district._lv_load_areas #List of LVLoadAreas contained in MVGridDisctrict
+
+        #Reset old lv_load_area values.
+        for lv_load_area in self.grid_district._lv_load_areas:
+
+            #Reset LVGDs to None
+            lv_load_area._lv_grid_districts = []
+
+            #Reset LVLoadAreaCentre to None
+            lv_load_area.lv_load_area_centre = None
+
+            # Set old peak_loads to 0
+            lv_load_area.peak_load = None
+
+            lv_load_area.peak_load_residential = None
+            lv_load_area.peak_load_retail = None
+            lv_load_area.peak_load_industrial = None
+            lv_load_area.peak_load_agricultural = None
+
+        #Create LVGD,LVGrid and LVStation for every node. Template above
+        for tuple in lv_station_tuple:
+
+            #Extract relevant data from tuple
+            id_db = tuple[1]['osmid']
+            stations_position = Point(tuple[1]['x'], tuple[1]['y'])
+            stations_load = tuple[1]['load']
+            # fixme: Apparently some LVstations don't lie in any lv_load_area. How is it possible?
+            lv_load_area = [x for x in mvgd_lv_load_areas if x.geo_area.contains(stations_position)][0]
+            lv_load_area.lv_load_area_centre = None
+            v_nom = cfg_ding0.get('assumptions', 'lv_nominal_voltage') / 1e3
+
+            #Create a convex hull of every building belonging to that trafo station
+            gdf_buildings_trafos = trafo_geodata[2]
+            convex_hull_geom = gpd.GeoSeries(
+                gdf_buildings_trafos[gdf_buildings_trafos['trafo'] == tuple[1]['osmid']].unary_union.convex_hull)[0]
+
+
+            lv_grid_district = LVGridDistrictDing0(id_db=id_db,
+                                                   lv_load_area=lv_load_area,
+                                                   peak_load= stations_load,
+                                                   geo_data=convex_hull_geom,
+                                                   peak_load_residential = None,
+                                                   peak_load_retail = None,
+                                                   peak_load_industrial = None,
+                                                   peak_load_agricultural = None)
+
+            lv_grid = LVGridDing0(network=self.network,
+                                  grid_district=lv_grid_district,
+                                  id_db=id_db,
+                                  v_level=v_nom)
+
+            mapping[tuple[0]] = LVStationDing0(geo_data=stations_position,
+                                               id_db=id_db,
+                                               peak_load=stations_load,
+                                               network=self.network,
+                                               grid = lv_grid,
+                                               lv_grid_district = lv_grid_district,
+                                               lv_load_area = lv_load_area) #v_level_operation=lv_grid.v_level
+
+
+
+            lv_grid.add_station(mapping[tuple[0]]) #Adds station to lv_grid
+            lv_grid_district.lv_grid = lv_grid
+            lv_load_area.add_lv_grid_district(lv_grid_district)
+
+            #Create and add new transformers for every LVstation
+            build_grid.transformer(lv_grid)
+
+        logger.info('=====> Urban/aggregated LVGrids created')
+
+        #Replace old node objects with Ding0Objects inside the graph. This graph contains all ways and stations
+        street_graph_stations_full = nx.relabel_nodes(street_graph_station, mapping)
+
+        #Create a subgraph containin only station nodes. Needed later for solve_urban
+        street_graph_stations_only = street_graph_stations_full.subgraph(mapping.values())
+
+        #Convert graph data into a dict of dicts and perform dijktra on every station pair, routing throught the street's network.
+        specs = convert_graph_to_specs(self,street_graph_stations_only, street_graph_stations_full, mapping)
+
+        #Check if graph is frozen. In that case create a unfreezed copy
+        if nx.is_frozen(street_graph_stations_only):
+            street_graph_stations_only = nx.Graph(street_graph_stations_only)
+
+        # do the routing
+        self._graph = mv_routing.solve_urban(graph=street_graph_stations_only, #fixme: try_except in savings
+                                        debug=debug,
+                                        anim=anim,
+                                        specs = specs,
+                                        city_graph = street_graph_stations_full)
+
+        #Filter routed edges from full graph and create newly routed graph
+        ring_network_geodata = filter_edges_in_rings(self,street_graph_stations_full)
+
+        plot_graph(ring_network_geodata)
+
+        path_lengths = [elem[2]['length'] for elem in list(ring_network_geodata.edges(data=True))] #lenghts of all paths in the rings
+
+        logger.info('==> MV Routing for {} done'.format(repr(self)))
 
     def routing(self, debug=False, anim=None):
         """ Performs routing on Load Area centres to build MV grid with ring topology.
